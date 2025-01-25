@@ -6,16 +6,22 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
-  - nodes
   - namespaces
-  - configmaps
   verbs:
   - get
-  - patch
   - list
   - watch
   - update
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - nodes
+  - configmaps
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - apps
   resources:
@@ -25,10 +31,8 @@ rules:
   - statefulsets
   verbs:
   - get
-  - patch
   - list
   - watch
-  - update
 - apiGroups:
   - batch
   resources:
@@ -36,10 +40,8 @@ rules:
   - cronjobs
   verbs:
   - get
-  - patch
   - list
   - watch
-  - update
 - apiGroups:
   - security.kubearmor.com
   resources:
@@ -68,8 +70,8 @@ rules:
   resources:
   - pods
   verbs:
-  - get
   - list
+  - watch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -159,31 +161,4 @@ rules:
   verbs:
   - create
   - patch
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ .Values.kubearmorController.name }}-proxy-role
-rules:
-- apiGroups:
-  - authentication.k8s.io
-  resources:
-  - tokenreviews
-  verbs:
-  - create
-- apiGroups:
-  - authorization.k8s.io
-  resources:
-  - subjectaccessreviews
-  verbs:
-  - create
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ .Values.kubearmorController.name }}-metrics-reader-role
-rules:
-- nonResourceURLs:
-  - /metrics
-  verbs:
-  - get
+

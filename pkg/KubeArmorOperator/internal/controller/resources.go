@@ -7,6 +7,10 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -81,6 +85,17 @@ func generateDaemonset(name, enforcer, runtime, socket, btfPresent, apparmorfs, 
 			},
 		}
 	}
+
+	// TODO: handle passing annotateResource flag to kubearmor
+	// ideally this configuration should be part of kubearmoconfig to avoid hardcoding version checks
+	// to detect flag compatibility
+
+	// if annotateResource {
+	// 	common.AddOrReplaceArg("-annotateResource=true", "-annotateResource=false", &daemonset.Spec.Template.Spec.Containers[0].Args)
+	// } else {
+	// 	common.AddOrReplaceArg("-annotateResource=false", "-annotateResource=true", &daemonset.Spec.Template.Spec.Containers[0].Args)
+	// }
+
 	if common.EnableTls {
 		vols = append(vols, common.KubeArmorCaVolume...)
 		volMnts = append(volMnts, common.KubeArmorCaVolumeMount...)
@@ -95,6 +110,9 @@ func generateDaemonset(name, enforcer, runtime, socket, btfPresent, apparmorfs, 
 		daemonset.Spec.Template.Spec.InitContainers[0].VolumeMounts = commonVolMnts
 		daemonset.Spec.Template.Spec.InitContainers[0].Image = common.GetApplicationImage(common.KubeArmorInitName)
 		daemonset.Spec.Template.Spec.InitContainers[0].ImagePullPolicy = corev1.PullPolicy(common.KubeArmorInitImagePullPolicy)
+		UpdateArgsIfDefinedAndUpdated(&daemonset.Spec.Template.Spec.InitContainers[0].Args, common.KubeArmorInitArgs)
+		UpdateImagePullSecretsIfDefinedAndUpdated(&daemonset.Spec.Template.Spec.ImagePullSecrets, common.KubeArmorInitImagePullSecrets)
+		UpdateTolerationsIfDefinedAndUpdated(&daemonset.Spec.Template.Spec.Tolerations, common.KubeArmorInitTolerations)
 	}
 	// update images
 	if seccompPresent == "yes" && common.ConfigDefaultSeccompEnabled == "true" {
@@ -113,6 +131,15 @@ func generateDaemonset(name, enforcer, runtime, socket, btfPresent, apparmorfs, 
 
 	daemonset.Spec.Template.Spec.Containers[0].Image = common.GetApplicationImage(common.KubeArmorName)
 	daemonset.Spec.Template.Spec.Containers[0].ImagePullPolicy = corev1.PullPolicy(common.KubeArmorImagePullPolicy)
+	UpdateArgsIfDefinedAndUpdated(&daemonset.Spec.Template.Spec.Containers[0].Args, common.KubeArmorArgs)
+	UpdateImagePullSecretsIfDefinedAndUpdated(&daemonset.Spec.Template.Spec.ImagePullSecrets, common.KubeArmorImagePullSecrets)
+	UpdateTolerationsIfDefinedAndUpdated(&daemonset.Spec.Template.Spec.Tolerations, common.KubeArmorInitTolerations)
+	if len(daemonset.Spec.Template.Spec.ImagePullSecrets) < 1 {
+		updateImagePullSecretFromGlobal(common.GlobalImagePullSecrets, &daemonset.Spec.Template.Spec.ImagePullSecrets)
+	}
+	if len(daemonset.Spec.Template.Spec.Tolerations) < 1 {
+		updateTolerationFromGlobal(common.GlobalTolerations, &daemonset.Spec.Template.Spec.Tolerations)
+	}
 	daemonset = addOwnership(daemonset).(*appsv1.DaemonSet)
 	fmt.Printf("generated daemonset: %v", daemonset)
 	return daemonset
@@ -306,7 +333,7 @@ func deploySnitch(nodename string, runtime string) *batchv1.Job {
 						VolumeSource: corev1.VolumeSource{
 							HostPath: &corev1.HostPathVolumeSource{
 								Path: "/etc/apparmor.d/",
-								Type: &common.HostPathDirectoryOrCreate,
+								Type: &common.HostPathDirectory,
 							},
 						},
 					},
@@ -469,6 +496,160 @@ func (clusterWatcher *ClusterWatcher) deployControllerDeployment(deployment *app
 	return nil
 }
 
+func (clusterWatcher *ClusterWatcher) getProvider(providerHostname, providerEndpoint string) (string, string, string) {
+	nodes, err := clusterWatcher.Client.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		clusterWatcher.Log.Warnf("Error listing nodes: %s\n", err.Error())
+	}
+
+	for _, node := range nodes.Items {
+		for key, label := range node.Labels {
+			if strings.Contains(key, "gke") || strings.Contains(label, "gke") {
+				if providerHostname != "" && providerEndpoint == "" {
+					providerEndpoint = "/computeMetadata/v1/instance/attributes/cluster-name"
+				} else if providerHostname == "" && providerEndpoint != "" {
+					providerHostname = "http://metadata.google.internal"
+				} else if providerHostname == "" && providerEndpoint == "" {
+					providerHostname = "http://metadata.google.internal"
+					providerEndpoint = "/computeMetadata/v1/instance/attributes/cluster-name"
+				}
+				return "gke", providerHostname, providerEndpoint
+			} else if strings.Contains(key, "eks") || strings.Contains(label, "eks") {
+				if providerHostname != "" && providerEndpoint == "" {
+					providerEndpoint = "/latest/user-data"
+				} else if providerHostname == "" && providerEndpoint != "" {
+					providerHostname = "http://169.254.169.254"
+				} else if providerHostname == "" && providerEndpoint == "" {
+					providerHostname = "http://169.254.169.254"
+					providerEndpoint = "/latest/user-data"
+				}
+				return "eks", providerHostname, providerEndpoint
+			}
+		}
+	}
+	return "default", "", ""
+}
+
+func (clusterWatcher *ClusterWatcher) fetchClusterNameFromGKE(providerHostname, providerEndpoint string) (string, error) {
+	url := providerHostname + providerEndpoint
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		clusterWatcher.Log.Warnf("failed to create request: %w, check provider host name and endpoint", err)
+		return "", err
+	}
+
+	// Set the required header
+	req.Header.Set("Metadata-Flavor", "Google")
+
+	// Create an HTTP client and make the request
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		clusterWatcher.Log.Warnf("error making request: %w, check provider host name and endpoint", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	// Check for a successful response
+	if resp.StatusCode != http.StatusOK {
+		clusterWatcher.Log.Warnf("failed to fetch from metadata, status code: %d", resp.StatusCode)
+		return "", err
+	}
+
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		clusterWatcher.Log.Warnf("error reading response body: %w", err)
+		return "", err
+	}
+
+	return string(body), nil
+}
+
+func (clusterWatcher *ClusterWatcher) fetchClusterNameFromAWS(providerHostname, providerEndpoint string) (string, error) {
+	var token []byte
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, err := http.NewRequest("PUT", providerHostname+"/latest/api/token", nil)
+	if err != nil {
+		clusterWatcher.Log.Warnf("failed to create request for fetching token: %w, check provider host name", err)
+		return "", err
+	}
+	req.Header.Set("X-aws-ec2-metadata-token-ttl-seconds", "21600")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		clusterWatcher.Log.Warnf("error making request: %w", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		token, err = io.ReadAll(resp.Body)
+		if err != nil {
+			clusterWatcher.Log.Warnf("failed to read token: %d", err)
+			return "", err
+		}
+	}
+
+	// Fetch the EKS cluster name from user data
+	url := providerHostname + providerEndpoint
+	req, err = http.NewRequest("GET", url, nil)
+	client = &http.Client{Timeout: 2 * time.Second}
+	if err != nil {
+		clusterWatcher.Log.Warnf("failed to create request for fetching metadata: %w, check provider host name and endpoint", err)
+		return "", err
+	}
+	req.Header.Set("X-aws-ec2-metadata-token", string(token))
+
+	resp, err = client.Do(req)
+	if err != nil {
+		clusterWatcher.Log.Warnf("error making request: %w", err)
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		clusterWatcher.Log.Warnf("failed to fetch from metadata, status code: %d", resp.StatusCode)
+		return "", err
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		clusterWatcher.Log.Warnf("failed to read metadata: %d", err)
+		return "", err
+	}
+
+	// Extract EKS cluster name
+	re := regexp.MustCompile(`/etc/eks/bootstrap\.sh (\S+)`)
+	match := re.FindStringSubmatch(string(body))
+	if len(match) > 0 {
+		return match[1], nil
+	}
+
+	return "", err
+}
+
+func (clusterWatcher *ClusterWatcher) GetClusterName(providerHostname, providerEndpoint string) string {
+	provider, pHostname, pEndpoint := clusterWatcher.getProvider(ProviderHostname, providerEndpoint)
+	if provider == "gke" {
+		clusterWatcher.Log.Infof("Provider is GKE")
+		if clusterName, err := clusterWatcher.fetchClusterNameFromGKE(pHostname, pEndpoint); err != nil {
+			clusterWatcher.Log.Warnf("Cannot fetch cluster name for GKE %s", err.Error())
+		} else {
+			return clusterName
+		}
+	} else if provider == "eks" {
+		clusterWatcher.Log.Infof("Provider is EKS")
+		if clusterName, err := clusterWatcher.fetchClusterNameFromAWS(pHostname, pEndpoint); err != nil {
+			clusterWatcher.Log.Warnf("Cannot fetch cluster name for EKS %s", err.Error())
+		} else {
+			return clusterName
+		}
+	}
+
+	return "default"
+}
+
 func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 	var caCert, tlsCrt, tlsKey *bytes.Buffer
 	var kGenErr, err, installErr error
@@ -481,16 +662,31 @@ func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 	}
 	clusterRoles := []*rbacv1.ClusterRole{
 		addOwnership(genSnitchRole()).(*rbacv1.ClusterRole),
-		addOwnership(deployments.GetClusterRole()).(*rbacv1.ClusterRole),
 		addOwnership(deployments.GetRelayClusterRole()).(*rbacv1.ClusterRole),
-		addOwnership(deployments.GetKubeArmorControllerProxyRole()).(*rbacv1.ClusterRole),
 		addOwnership(deployments.GetKubeArmorControllerClusterRole()).(*rbacv1.ClusterRole),
 	}
+
+	kaClusterRole := addOwnership(deployments.GetClusterRole()).(*rbacv1.ClusterRole)
+	if annotateResource {
+		kaClusterRole.Rules = append(kaClusterRole.Rules, []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"apps"},
+				Resources: []string{"deployments", "replicasets", "daemonsets", "statefulsets"},
+				Verbs:     []string{"patch", "update"},
+			},
+			{
+				APIGroups: []string{"batch"},
+				Resources: []string{"jobs", "cronjobs"},
+				Verbs:     []string{"patch", "update"},
+			},
+		}...)
+	}
+	clusterRoles = append(clusterRoles, kaClusterRole)
+
 	clusterRoleBindings := []*rbacv1.ClusterRoleBinding{
 		addOwnership(deployments.GetClusterRoleBinding(common.Namespace)).(*rbacv1.ClusterRoleBinding),
 		addOwnership(deployments.GetRelayClusterRoleBinding(common.Namespace)).(*rbacv1.ClusterRoleBinding),
 		addOwnership(deployments.GetKubeArmorControllerClusterRoleBinding(common.Namespace)).(*rbacv1.ClusterRoleBinding),
-		addOwnership(deployments.GetKubeArmorControllerProxyRoleBinding(common.Namespace)).(*rbacv1.ClusterRoleBinding),
 		addOwnership(genSnitchRoleBinding()).(*rbacv1.ClusterRoleBinding),
 	}
 	roles := []*rbacv1.Role{
@@ -501,7 +697,6 @@ func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 	}
 
 	svcs := []*corev1.Service{
-		addOwnership(deployments.GetKubeArmorControllerMetricsService(common.Namespace)).(*corev1.Service),
 		addOwnership(deployments.GetKubeArmorControllerWebhookService(common.Namespace)).(*corev1.Service),
 		addOwnership(deployments.GetRelayService(common.Namespace)).(*corev1.Service),
 	}
@@ -533,7 +728,114 @@ func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 	// kubearmor-controller and relay-server deployments
 	controller := deployments.GetKubeArmorControllerDeployment(common.Namespace)
 	relayServer := deployments.GetRelayDeployment(common.Namespace)
+	// update args, imagePullSecrets and tolerations
+	UpdateArgsIfDefinedAndUpdated(&controller.Spec.Template.Spec.Containers[0].Args, common.KubeArmorControllerArgs)
+	UpdateImagePullSecretsIfDefinedAndUpdated(&controller.Spec.Template.Spec.ImagePullSecrets, common.KubeArmorControllerImagePullSecrets)
+	UpdateTolerationsIfDefinedAndUpdated(&controller.Spec.Template.Spec.Tolerations, common.KubeArmorControllerTolerations)
+	if len(controller.Spec.Template.Spec.ImagePullSecrets) < 1 {
+		updateImagePullSecretFromGlobal(common.GlobalImagePullSecrets, &controller.Spec.Template.Spec.ImagePullSecrets)
+	}
+	if len(controller.Spec.Template.Spec.Tolerations) < 1 {
+		updateTolerationFromGlobal(common.GlobalTolerations, &controller.Spec.Template.Spec.Tolerations)
+	}
+	UpdateArgsIfDefinedAndUpdated(&relayServer.Spec.Template.Spec.Containers[0].Args, common.KubeArmorRelayArgs)
+	UpdateImagePullSecretsIfDefinedAndUpdated(&relayServer.Spec.Template.Spec.ImagePullSecrets, common.KubeArmorControllerImagePullSecrets)
+	UpdateTolerationsIfDefinedAndUpdated(&relayServer.Spec.Template.Spec.Tolerations, common.KubeArmorControllerTolerations)
+	if len(relayServer.Spec.Template.Spec.ImagePullSecrets) < 1 {
+		updateImagePullSecretFromGlobal(common.GlobalImagePullSecrets, &relayServer.Spec.Template.Spec.ImagePullSecrets)
+	}
+	if len(relayServer.Spec.Template.Spec.Tolerations) < 1 {
+		updateTolerationFromGlobal(common.GlobalTolerations, &relayServer.Spec.Template.Spec.Tolerations)
+	}
+	// update relay env vars
+	relayServer.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{
+		{
+			Name:  "ENABLE_STDOUT_LOGS",
+			Value: common.KubearmorRelayEnvMap[common.EnableStdOutLogs],
+		},
+		{
+			Name:  "ENABLE_STDOUT_ALERTS",
+			Value: common.KubearmorRelayEnvMap[common.EnableStdOutAlerts],
+		},
+		{
+			Name:  "ENABLE_STDOUT_MSGS",
+			Value: common.KubearmorRelayEnvMap[common.EnableStdOutMsgs],
+		},
+		{
+			Name:  "ENABLE_DASHBOARDS",
+			Value: strconv.FormatBool(common.Adapter.ElasticSearch.Enabled),
+		},
+		{
+			Name:  "ES_URL",
+			Value: common.Adapter.ElasticSearch.Url,
+		},
+		{
+			Name:  "ES_ALERTS_INDEX",
+			Value: common.Adapter.ElasticSearch.AlertsIndexName,
+		},
+		{
+			Name: "ES_USERNAME",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: common.Adapter.ElasticSearch.Auth.SecretName,
+					},
+					Key:      common.Adapter.ElasticSearch.Auth.UserNameKey,
+					Optional: &common.Pointer2True,
+				},
+			},
+		},
+		{
+			Name: "ES_PASSWORD",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: common.Adapter.ElasticSearch.Auth.SecretName,
+					},
+					Key:      common.Adapter.ElasticSearch.Auth.PasswordKey,
+					Optional: &common.Pointer2True,
+				},
+			},
+		},
+	}
 
+	ElasticSearchAdapterCaVolume := []corev1.Volume{
+		{
+			Name: "elastic-ca",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: common.Adapter.ElasticSearch.Auth.CAcertSecretName,
+				},
+			},
+		},
+	}
+
+	ElasticSearchAdapterCaVolumeMount := []corev1.VolumeMount{
+		{
+			Name:      "elastic-ca",
+			MountPath: common.ElasticSearchAdapterCaCertPath,
+		},
+	}
+
+	if common.Adapter.ElasticSearch.Auth.CAcertSecretName != "" {
+		relayServer.Spec.Template.Spec.Containers[0].Env = append(relayServer.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+			Name:  "ES_CA_CERT_PATH",
+			Value: common.ElasticSearchAdapterCaCertPath + "/" + common.Adapter.ElasticSearch.Auth.CaCertKey,
+		})
+
+		common.AddOrRemoveVolume(&ElasticSearchAdapterCaVolume, &relayServer.Spec.Template.Spec.Volumes, common.AddAction)
+		common.AddOrRemoveVolumeMount(&ElasticSearchAdapterCaVolumeMount, &relayServer.Spec.Template.Spec.Containers[0].VolumeMounts, common.AddAction)
+	} else {
+		common.AddOrRemoveVolume(&ElasticSearchAdapterCaVolume, &relayServer.Spec.Template.Spec.Volumes, common.DeleteAction)
+		common.AddOrRemoveVolumeMount(&ElasticSearchAdapterCaVolumeMount, &relayServer.Spec.Template.Spec.Containers[0].VolumeMounts, common.DeleteAction)
+	}
+
+	if common.Adapter.ElasticSearch.Auth.AllowTlsInsecure {
+		relayServer.Spec.Template.Spec.Containers[0].Env = append(relayServer.Spec.Template.Spec.Containers[0].Env, corev1.EnvVar{
+			Name:  "ES_ALLOW_INSECURE_TLS",
+			Value: "true",
+		})
+	}
 	if common.EnableTls {
 		relayServer.Spec.Template.Spec.Containers[0].VolumeMounts =
 			append(relayServer.Spec.Template.Spec.Containers[0].VolumeMounts, common.KubeArmorRelayTlsVolumeMount...)
@@ -550,9 +852,6 @@ func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 		if container.Name == "manager" {
 			(*containers)[i].Image = common.GetApplicationImage(common.KubeArmorControllerName)
 			(*containers)[i].ImagePullPolicy = corev1.PullPolicy(common.KubeArmorControllerImagePullPolicy)
-		} else {
-			(*containers)[i].Image = common.GetApplicationImage(common.KubeRbacProxyName)
-			(*containers)[i].ImagePullPolicy = corev1.PullPolicy(common.KubeRbacProxyImagePullPolicy)
 		}
 	}
 	relayServer.Spec.Template.Spec.Containers[0].Image = common.GetApplicationImage(common.KubeArmorRelayName)
@@ -564,6 +863,7 @@ func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 	// kubearmor configmap
 	configmap := addOwnership(deployments.GetKubearmorConfigMap(common.Namespace, deployments.KubeArmorConfigMapName)).(*corev1.ConfigMap)
 	configmap.Data = common.ConfigMapData
+	configmap.Data["cluster"] = clusterWatcher.GetClusterName(ProviderHostname, ProviderEndpoint)
 
 	for {
 		caCert, tlsCrt, tlsKey, kGenErr = common.GeneratePki(common.Namespace, deployments.KubeArmorControllerWebhookServiceName)
@@ -730,6 +1030,10 @@ func (clusterWatcher *ClusterWatcher) WatchRequiredResources() {
 		} else {
 			installErr = err
 			clusterWatcher.Log.Error(err.Error())
+		}
+
+		if err := clusterWatcher.WatchRecommendedPolicies(); err != nil {
+			installErr = err
 		}
 
 		// update operatingConfigCrd status to Running

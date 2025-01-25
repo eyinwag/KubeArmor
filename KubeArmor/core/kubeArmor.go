@@ -18,6 +18,7 @@ import (
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	kg "github.com/kubearmor/KubeArmor/KubeArmor/log"
 	"github.com/kubearmor/KubeArmor/KubeArmor/policy"
+	"github.com/kubearmor/KubeArmor/KubeArmor/presets"
 	"github.com/kubearmor/KubeArmor/KubeArmor/state"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 	"google.golang.org/grpc/health"
@@ -27,10 +28,9 @@ import (
 
 	efc "github.com/kubearmor/KubeArmor/KubeArmor/enforcer"
 	fd "github.com/kubearmor/KubeArmor/KubeArmor/feeder"
-	pb "github.com/kubearmor/KubeArmor/protobuf"
-
 	kvm "github.com/kubearmor/KubeArmor/KubeArmor/kvmAgent"
 	mon "github.com/kubearmor/KubeArmor/KubeArmor/monitor"
+	pb "github.com/kubearmor/KubeArmor/protobuf"
 )
 
 // ====================== //
@@ -93,6 +93,9 @@ type KubeArmorDaemon struct {
 
 	// runtime enforcer
 	RuntimeEnforcer *efc.RuntimeEnforcer
+
+	// presets
+	Presets *presets.Preset
 
 	// kvm agent
 	KVMAgent *kvm.KVMAgent
@@ -302,6 +305,25 @@ func (dm *KubeArmorDaemon) CloseRuntimeEnforcer() bool {
 	return true
 }
 
+// ============= //
+// == Presets == //
+// ============= //
+
+// InitPresets Function
+func (dm *KubeArmorDaemon) InitPresets(logger *fd.Feeder, monitor *mon.SystemMonitor) bool {
+	dm.Presets = presets.NewPreset(dm.Logger, dm.SystemMonitor)
+	return dm.Presets != nil
+}
+
+// ClosePresets Function
+func (dm *KubeArmorDaemon) ClosePresets() bool {
+	if err := dm.Presets.Destroy(); err != nil {
+		dm.Logger.Errf("Failed to destroy preset (%s)", err.Error())
+		return false
+	}
+	return true
+}
+
 // =============== //
 // == KVM Agent == //
 // =============== //
@@ -412,6 +434,8 @@ func KubeArmor() {
 
 		dm.Node.KernelVersion = kl.GetCommandOutputWithoutErr("uname", []string{"-r"})
 		dm.Node.KernelVersion = strings.TrimSuffix(dm.Node.KernelVersion, "\n")
+
+		dm.WatchConfigChanges()
 
 		dm.NodeLock.Unlock()
 
@@ -558,6 +582,13 @@ func KubeArmor() {
 				dm.Logger.Print("Started to protect a host and containers")
 			}
 		}
+
+		// initialize presets
+		if !dm.InitPresets(dm.Logger, dm.SystemMonitor) {
+			dm.Logger.Print("Disabled Presets since no presets are enabled")
+		} else {
+			dm.Logger.Print("Initialized Presets")
+		}
 	}
 
 	enableContainerPolicy := true
@@ -566,9 +597,6 @@ func KubeArmor() {
 
 	// Un-orchestrated workloads
 	if !dm.K8sEnabled && cfg.GlobalCfg.Policy {
-
-		dm.SetContainerNSVisibility()
-
 		// Check if cri socket set, if not then auto detect
 		if cfg.GlobalCfg.CRISocket == "" {
 			if kl.GetCRISocket("") == "" {
@@ -577,31 +605,52 @@ func KubeArmor() {
 			} else {
 				cfg.GlobalCfg.CRISocket = "unix://" + kl.GetCRISocket("")
 			}
-		}
-
-		// monitor containers
-		if strings.Contains(cfg.GlobalCfg.CRISocket, "docker") {
-			// update already deployed containers
-			dm.GetAlreadyDeployedDockerContainers()
-			// monitor docker events
-			go dm.MonitorDockerEvents()
-		} else if strings.Contains(cfg.GlobalCfg.CRISocket, "containerd") {
-			// monitor containerd events
-			go dm.MonitorContainerdEvents()
-		} else if strings.Contains(cfg.GlobalCfg.CRISocket, "cri-o") {
-			// monitor crio events
-			go dm.MonitorCrioEvents()
 		} else {
-			dm.Logger.Warnf("Failed to monitor containers: %s is not a supported CRI socket.", cfg.GlobalCfg.CRISocket)
-			enableContainerPolicy = false
+			// CRI socket supplied by user, check for existence
+			criSocketPath := strings.TrimPrefix(cfg.GlobalCfg.CRISocket, "unix://")
+			_, err := os.Stat(criSocketPath)
+			if err != nil {
+				enableContainerPolicy = false
+				dm.Logger.Warnf("Error while looking for CRI socket file %s", err.Error())
+			}
 		}
 
-		dm.Logger.Printf("Using %s for monitoring containers", cfg.GlobalCfg.CRISocket)
+		if enableContainerPolicy {
+			dm.SetContainerNSVisibility()
+
+			// monitor containers
+			if strings.Contains(cfg.GlobalCfg.CRISocket, "docker") {
+				// update already deployed containers
+				dm.GetAlreadyDeployedDockerContainers()
+				// monitor docker events
+				go dm.MonitorDockerEvents()
+			} else if strings.Contains(cfg.GlobalCfg.CRISocket, "containerd") {
+				// insuring NRI monitoring only in case containerd is present
+				if dm.checkNRIAvailability() {
+					// monitor NRI events
+					go dm.MonitorNRIEvents()
+				} else {
+					// monitor containerd events
+					go dm.MonitorContainerdEvents()
+				}
+			} else if strings.Contains(cfg.GlobalCfg.CRISocket, "cri-o") {
+				// monitor crio events
+				go dm.MonitorCrioEvents()
+			} else {
+				enableContainerPolicy = false
+				dm.Logger.Warnf("Failed to monitor containers: %s is not a supported CRI socket.", cfg.GlobalCfg.CRISocket)
+			}
+
+			dm.Logger.Printf("Using %s for monitoring containers", cfg.GlobalCfg.CRISocket)
+		}
+
 	}
 
 	if dm.K8sEnabled && cfg.GlobalCfg.Policy {
-		// check if the CRI socket set while executing kubearmor exists
-		if cfg.GlobalCfg.CRISocket != "" {
+		if dm.checkNRIAvailability() {
+			// monitor NRI events
+			go dm.MonitorNRIEvents()
+		} else if cfg.GlobalCfg.CRISocket != "" { // check if the CRI socket set while executing kubearmor exists
 			trimmedSocket := strings.TrimPrefix(cfg.GlobalCfg.CRISocket, "unix://")
 			if _, err := os.Stat(trimmedSocket); err != nil {
 				dm.Logger.Warnf("Error while looking for CRI socket file: %s", err.Error())
@@ -778,7 +827,10 @@ func KubeArmor() {
 	}
 
 	if !dm.K8sEnabled && (enableContainerPolicy || cfg.GlobalCfg.HostPolicy) {
-		policyService := &policy.PolicyServer{}
+		policyService := &policy.PolicyServer{
+			ContainerPolicyEnabled: enableContainerPolicy,
+			HostPolicyEnabled:      cfg.GlobalCfg.HostPolicy,
+		}
 		if enableContainerPolicy {
 			policyService.UpdateContainerPolicy = dm.ParseAndUpdateContainerSecurityPolicy
 			dm.Logger.Print("Started to monitor container security policies on gRPC")
@@ -796,6 +848,7 @@ func KubeArmor() {
 		pb.RegisterProbeServiceServer(dm.Logger.LogServer, probe)
 
 		dm.SetHealthStatus(pb.PolicyService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+		dm.SetHealthStatus(pb.ProbeService_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 	}
 
 	reflection.Register(dm.Logger.LogServer) // Helps grpc clients list out what all svc/endpoints available
@@ -845,4 +898,24 @@ func KubeArmor() {
 
 	// destroy the daemon
 	dm.DestroyKubeArmorDaemon()
+}
+
+func (dm *KubeArmorDaemon) checkNRIAvailability() bool {
+	// Check if nri socket is set, if not then auto detect
+	if cfg.GlobalCfg.NRISocket == "" {
+		if kl.GetNRISocket("") != "" {
+			cfg.GlobalCfg.NRISocket = kl.GetNRISocket("")
+		} else {
+			dm.Logger.Warnf("Error while looking for NRI socket file")
+			return false
+		}
+	} else {
+		// NRI socket supplied by user, check for existence
+		_, err := os.Stat(cfg.GlobalCfg.NRISocket)
+		if err != nil {
+			dm.Logger.Warnf("Error while looking for NRI socket file %s", err.Error())
+			return false
+		}
+	}
+	return true
 }

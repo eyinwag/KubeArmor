@@ -498,7 +498,7 @@ func (fd *Feeder) PushMessage(level, message string) {
 	pbMsg.UpdatedTime = updatedTime
 
 	//pbMsg.ClusterName = cfg.GlobalCfg.Cluster
-	pbMsg.ClusterName = fd.Node.ClusterName
+	pbMsg.ClusterName = cfg.GlobalCfg.Cluster
 
 	pbMsg.HostName = cfg.GlobalCfg.Host
 	pbMsg.HostIP = fd.Node.NodeIP
@@ -534,7 +534,8 @@ func (fd *Feeder) PushLog(log tp.Log) {
 	   in case of enforcer = AppArmor only Default Posture logs will be converted to
 	   container/host log depending upon the defaultPostureLogs flag
 	*/
-	if (cfg.GlobalCfg.EnforcerAlerts && fd.Enforcer == "BPFLSM" && log.Enforcer != "BPFLSM") || (fd.Enforcer != "BPFLSM" && !cfg.GlobalCfg.DefaultPostureLogs) {
+
+	if (cfg.GlobalCfg.EnforcerAlerts && fd.Enforcer == "BPFLSM" && log.Enforcer == "eBPF Monitor") || (fd.Enforcer != "BPFLSM" && !cfg.GlobalCfg.DefaultPostureLogs) {
 		log = fd.UpdateMatchedPolicy(log)
 		if (log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy") && ((fd.Enforcer == "BPFLSM" && (strings.Contains(log.PolicyName, "DefaultPosture") || !strings.Contains(log.Action, "Audit"))) || (fd.Enforcer != "BPFLSM" && strings.Contains(log.PolicyName, "DefaultPosture"))) {
 			if log.Type == "MatchedPolicy" {
@@ -545,7 +546,7 @@ func (fd *Feeder) PushLog(log tp.Log) {
 		}
 	} else {
 		log = fd.UpdateMatchedPolicy(log)
-		if fd.Enforcer == "BPFLSM" {
+		if fd.Enforcer == "BPFLSM" && !strings.Contains(log.Enforcer, "PRESET") {
 			log.Enforcer = "BPFLSM"
 		}
 	}
@@ -553,6 +554,9 @@ func (fd *Feeder) PushLog(log tp.Log) {
 	if log.Source == "" {
 		// even if a log doesn't have a source, it must have a type
 		if log.Type == "" {
+			if strings.Contains(log.Enforcer, "PRESET") {
+				kg.Printf("no source and type: %s\n", log.Enforcer)
+			}
 			return
 		}
 		fd.Debug("Pushing Telemetry without source")
@@ -579,12 +583,26 @@ func (fd *Feeder) PushLog(log tp.Log) {
 
 	// gRPC output
 	if log.Type == "MatchedPolicy" || log.Type == "MatchedHostPolicy" || log.Type == "SystemEvent" {
+
+		// checking throttling condition for "Audit" alerts when enforcer is 'eBPF Monitor'
+		if cfg.GlobalCfg.AlertThrottling && ((strings.Contains(log.Action, "Audit") && log.Enforcer == "eBPF Monitor") || (log.Type == "MatchedHostPolicy" && (log.Enforcer == "AppArmor" || log.Enforcer == "eBPF Monitor"))) {
+			nsKey := fd.ContainerNsKey[log.ContainerID]
+			alert, throttle := fd.ShouldDropAlertsPerContainer(nsKey.PidNs, nsKey.MntNs)
+			if alert && throttle {
+				return
+			} else if alert && !throttle {
+				log.Operation = "AlertThreshold"
+				log.Type = "SystemEvent"
+				log.MaxAlertsPerSec = cfg.GlobalCfg.MaxAlertPerSec
+				log.DroppingAlertsInterval = cfg.GlobalCfg.ThrottleSec
+			}
+		}
 		pbAlert := pb.Alert{}
 
 		pbAlert.Timestamp = log.Timestamp
 		pbAlert.UpdatedTime = log.UpdatedTime
 
-		pbAlert.ClusterName = fd.Node.ClusterName
+		pbAlert.ClusterName = cfg.GlobalCfg.Cluster
 		pbAlert.HostName = fd.Node.NodeName
 
 		pbAlert.NamespaceName = log.NamespaceName
@@ -682,7 +700,7 @@ func (fd *Feeder) PushLog(log tp.Log) {
 		pbLog.Timestamp = log.Timestamp
 		pbLog.UpdatedTime = log.UpdatedTime
 
-		pbLog.ClusterName = fd.Node.ClusterName
+		pbLog.ClusterName = cfg.GlobalCfg.Cluster
 		pbLog.HostName = fd.Node.NodeName
 
 		pbLog.NamespaceName = log.NamespaceName

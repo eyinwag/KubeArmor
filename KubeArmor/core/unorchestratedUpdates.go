@@ -5,6 +5,8 @@ package core
 
 import (
 	"encoding/json"
+	"github.com/fsnotify/fsnotify"
+	"github.com/spf13/viper"
 	"os"
 	"regexp"
 	"sort"
@@ -38,6 +40,50 @@ func (dm *KubeArmorDaemon) SetContainerNSVisibility() {
 	dm.UpdateVisibility("ADDED", "container_namespace", visibility)
 }
 
+// =================== //
+// == Config Update == //
+// =================== //
+
+// WatchConfigChanges watches for configuration changes and updates the default posture
+func (dm *KubeArmorDaemon) WatchConfigChanges() {
+	viper.OnConfigChange(func(e fsnotify.Event) {
+		dm.Logger.Printf("Config file changed: %s", e.Name)
+		cfg.LoadDynamicConfig()
+
+		// Update the default posture
+		globalPosture := tp.DefaultPosture{
+			FileAction:         validateGlobalDefaultPosture(cfg.GlobalCfg.DefaultFilePosture),
+			NetworkAction:      validateGlobalDefaultPosture(cfg.GlobalCfg.DefaultNetworkPosture),
+			CapabilitiesAction: validateGlobalDefaultPosture(cfg.GlobalCfg.DefaultCapabilitiesPosture),
+		}
+		// Update the visibility
+		visibility := tp.Visibility{
+			File:         dm.validateVisibility("file", cfg.GlobalCfg.Visibility),
+			Process:      dm.validateVisibility("process", cfg.GlobalCfg.Visibility),
+			Network:      dm.validateVisibility("network", cfg.GlobalCfg.Visibility),
+			Capabilities: dm.validateVisibility("capabilities", cfg.GlobalCfg.Visibility),
+		}
+
+		// Apply the changes to the daemon
+		dm.UpdateGlobalPosture(globalPosture)
+
+		// Update default posture for endpoints
+		for _, ep := range dm.EndPoints {
+			dm.Logger.Printf("Updating Default Posture for endpoint %s", ep.EndPointName)
+			dm.UpdateDefaultPosture("MODIFIED", ep.NamespaceName, globalPosture, false)
+			dm.UpdateVisibility("MODIFIED", ep.NamespaceName, visibility)
+		}
+
+		// Update throttling configs
+		dm.SystemMonitor.UpdateThrottlingConfig()
+
+		// Update the default posture and visibility for the unorchestrated containers
+		dm.SystemMonitor.UpdateVisibility()
+		dm.UpdateHostSecurityPolicies()
+	})
+	viper.WatchConfig()
+}
+
 // ====================================== //
 // == Container Security Policy Update == //
 // ====================================== //
@@ -57,9 +103,14 @@ func (dm *KubeArmorDaemon) MatchandUpdateContainerSecurityPolicies(cid string) {
 			if cfg.GlobalCfg.Policy {
 				// update security policies
 				dm.Logger.UpdateSecurityPolicies("MODIFIED", ep)
-				if dm.RuntimeEnforcer != nil && ep.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-					// enforce security policies
-					dm.RuntimeEnforcer.UpdateSecurityPolicies(ep)
+				if ep.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					if dm.RuntimeEnforcer != nil {
+						// enforce security policies
+						dm.RuntimeEnforcer.UpdateSecurityPolicies(ep)
+					}
+					if dm.Presets != nil {
+						dm.Presets.UpdateSecurityPolicies(ep)
+					}
 				}
 			}
 		}
@@ -161,9 +212,14 @@ func (dm *KubeArmorDaemon) handlePolicyEvent(eventType string, createEndPoint bo
 			// update security policies
 			dm.Logger.UpdateSecurityPolicies("ADDED", newPoint)
 
-			if dm.RuntimeEnforcer != nil && newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-				// enforce security policies
-				dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+			if newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+				if dm.RuntimeEnforcer != nil {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+				}
+				if dm.Presets != nil {
+					dm.Presets.UpdateSecurityPolicies(newPoint)
+				}
 			}
 		}
 	} else if eventType == "MODIFIED" {
@@ -172,23 +228,32 @@ func (dm *KubeArmorDaemon) handlePolicyEvent(eventType string, createEndPoint bo
 			// update security policies
 			dm.Logger.UpdateSecurityPolicies("MODIFIED", newPoint)
 
-			if dm.RuntimeEnforcer != nil && newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-				// enforce security policies
-				dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+			if newPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+				if dm.RuntimeEnforcer != nil {
+					// enforce security policies
+					dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+				}
+				if dm.Presets != nil {
+					// enforce preset rules
+					dm.Presets.UpdateSecurityPolicies(newPoint)
+				}
 			}
 		}
 	} else { // DELETED
 		// update security policies after policy deletion
-		dm.EndPoints[endpointIdx] = newPoint
-
-		dm.Logger.UpdateSecurityPolicies("DELETED", newPoint)
-		dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
-
-		// delete endpoint if no containers or policies
-		if len(newPoint.Containers) == 0 && len(newPoint.SecurityPolicies) == 0 {
-			dm.EndPoints = append(dm.EndPoints[:endpointIdx], dm.EndPoints[endpointIdx+1:]...)
-			// since the length of endpoints slice reduced
-			endpointIdx--
+		if endpointIdx >= 0 {
+			dm.EndPoints[endpointIdx] = newPoint
+			dm.Logger.UpdateSecurityPolicies("DELETED", newPoint)
+			dm.RuntimeEnforcer.UpdateSecurityPolicies(newPoint)
+			if dm.Presets != nil {
+				dm.Presets.UpdateSecurityPolicies(newPoint)
+			}
+			// delete endpoint if no containers or policies
+			if len(newPoint.Containers) == 0 && len(newPoint.SecurityPolicies) == 0 {
+				dm.EndPoints = append(dm.EndPoints[:endpointIdx], dm.EndPoints[endpointIdx+1:]...)
+				// since the length of endpoints slice reduced
+				endpointIdx--
+			}
 		}
 	}
 
@@ -587,6 +652,7 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 	newPoint := tp.EndPoint{}
 	policyStatus := pb.PolicyStatus_Applied
 
+	// consider reducing coverage for this lock
 	dm.EndPointsLock.Lock()
 	defer dm.EndPointsLock.Unlock()
 	for idx, endPoint := range dm.EndPoints {
@@ -605,7 +671,9 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 					dm.Logger.UpdateSecurityPolicies("DELETED", endPoint)
 					endPoint.SecurityPolicies = append(endPoint.SecurityPolicies[:0], endPoint.SecurityPolicies[1:]...)
 					dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
-
+					if dm.Presets != nil {
+						dm.Presets.UpdateSecurityPolicies(endPoint)
+					}
 					endPoint = tp.EndPoint{}
 					endPointIndex--
 				} else if len(endPoint.SecurityPolicies) >= 1 {
@@ -622,9 +690,15 @@ func (dm *KubeArmorDaemon) ParseAndUpdateContainerSecurityPolicy(event tp.K8sKub
 						// update security policies
 						dm.Logger.UpdateSecurityPolicies("MODIFIED", endPoint)
 
-						if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
-							// enforce security policies
-							dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+						if endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+							if dm.RuntimeEnforcer != nil {
+								// enforce security policies
+								dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+							}
+							if dm.Presets != nil {
+								// enforce preset rules
+								dm.Presets.UpdateSecurityPolicies(endPoint)
+							}
 						}
 					}
 				}

@@ -179,7 +179,7 @@ type FileType struct {
 	Action ActionType `json:"action,omitempty"`
 }
 
-// +kubebuilder:validation:Pattern=(icmp|ICMP|tcp|TCP|udp|UDP|raw|RAW)$
+// +kubebuilder:validation:Pattern=(tcp|TCP|udp|UDP|raw|RAW|icmp|ICMP|icmpv6|ICMPV6|sctp|SCTP|stream|STREAM|dgram|DGRAM|rdm|RDM|seqpacket|SEQPACKET|dccp|DCCP|packet|PACKET|all|ALL)$
 type MatchNetworkProtocolStringType string
 
 type MatchNetworkProtocolType struct {
@@ -332,3 +332,9 @@ type SyscallsType struct {
 	// +kubebuilder:validation:optional
 	Message string `json:"message,omitempty"`
 }
+
+type PresetType string
+
+const (
+	FilelessProcessExec PresetType = "filelessProcessExec"
+)

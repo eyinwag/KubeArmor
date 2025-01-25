@@ -8,7 +8,7 @@ IMG ?= kubearmor/kubearmor-controller
 # Image Tag to use all building/pushing image targets
 TAG ?= v0.1
 # Produce CRDs that work back to Kubernetes 1.11 (no version conversion)
-CRD_OPTIONS ?= "crd:trivialVersions=true,preserveUnknownFields=false"
+CRD_OPTIONS ?= "crd"
 # Target platforms for build
 PLATFORM ?= "linux/amd64,linux/arm64/v8"
 
@@ -49,7 +49,7 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	go mod tidy; $(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	go mod tidy; $(CONTROLLER_GEN) crd rbac:roleName=manager-role webhook paths="./..." output:crd:artifacts:config=config/crd/bases
 	cp config/crd/bases/security.kubearmor.com_kubearmorpolicies.yaml ../../deployments/CRD/KubeArmorPolicy.yaml
 	cp config/crd/bases/security.kubearmor.com_kubearmorpolicies.yaml crd/KubeArmorPolicy.yaml
 	cp config/crd/bases/security.kubearmor.com_kubearmorpolicies.yaml ../../deployments/helm/KubeArmor/templates/crds/ksp.yaml
@@ -83,11 +83,11 @@ test: manifests generate fmt vet ## Run tests.
 
 .PHONY: build
 build: generate fmt vet ## Build manager binary.
-	go build -o bin/manager main.go
+	go build -o bin/manager cmd/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./main.go
+	go run ./cmd/main.go
 
 .PHONY: docker-build
 docker-build: build ## Build docker image with the manager.

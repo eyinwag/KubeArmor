@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -130,7 +131,7 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string,
 
 	pid := strconv.Itoa(containerInfo.Pid)
 
-	if data, err := os.Readlink("/proc/" + pid + "/ns/pid"); err == nil {
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/pid")); err == nil {
 		if _, err := fmt.Sscanf(data, "pid:[%d]\n", &container.PidNS); err != nil {
 			kg.Warnf("Unable to get PidNS (%s, %s, %s)", containerID, pid, err.Error())
 		}
@@ -138,7 +139,7 @@ func (ch *CrioHandler) GetContainerInfo(ctx context.Context, containerID string,
 		return container, err
 	}
 
-	if data, err := os.Readlink("/proc/" + pid + "/ns/mnt"); err == nil {
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/mnt")); err == nil {
 		if _, err := fmt.Sscanf(data, "mnt:[%d]\n", &container.MntNS); err != nil {
 			kg.Warnf("Unable to get MntNS (%s, %s, %s)", containerID, pid, err.Error())
 		}
@@ -275,12 +276,19 @@ func (dm *KubeArmorDaemon) UpdateCrioContainer(ctx context.Context, containerID,
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			if dm.Presets != nil {
+				dm.Presets.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			}
 
 			if len(endpoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
 				dm.Logger.UpdateSecurityPolicies("ADDED", endpoint)
 				if dm.RuntimeEnforcer != nil && endpoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
 					// enforce security policies
 					dm.RuntimeEnforcer.UpdateSecurityPolicies(endpoint)
+				}
+				if dm.Presets != nil && endpoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce preset rules
+					dm.Presets.UpdateSecurityPolicies(endpoint)
 				}
 			}
 		}

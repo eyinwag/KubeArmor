@@ -25,18 +25,25 @@ oci_meta:
     kubearmorOperator:
       image: kubearmor-operator
       tag: latest
-    kubeRbacProxy:
-      image: kube-rbac-proxy
-      tag: v0.15.0
 
 # in case if image pinning is disabled
 kubearmorOperator:
+  annotateResource: false
   name: kubearmor-operator
   image:
     repository: kubearmor/kubearmor-operator
     tag: ""
   imagePullPolicy: IfNotPresent
-  initDeploy: true
+  args: []
+  # https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
+  tolerations: ""
+  # Optional, but if there are a lot of image pulls required, Docker might be rate-limited. So, it's good to add pull secrets for production.
+  imagePullSecrets: ""
+  resources: {}
+  podLabels: {}
+  podAnnotations: {}
+  podSecurityContext: {}
+  securityContext: {}
 
 kubearmorConfig:
   defaultCapabilitiesPosture: audit
@@ -47,7 +54,7 @@ kubearmorConfig:
   enableStdOutAlerts: false
   enableStdOutMsgs: false
   seccompEnabled: true
-  alertThrottling: false
+  alertThrottling: true
   maxAlertPerSec: 10
   throttleSec: 30
 

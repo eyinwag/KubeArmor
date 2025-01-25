@@ -6,7 +6,6 @@ package deployments
 import (
 	"strconv"
 
-	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -14,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
 )
 
 // GetServiceAccount Function
@@ -43,18 +44,23 @@ func GetClusterRole() *rbacv1.ClusterRole {
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"pods", "nodes", "namespaces", "configmaps"},
-				Verbs:     []string{"get", "patch", "list", "watch", "update"},
+				Resources: []string{"namespaces"},
+				Verbs:     []string{"get", "list", "watch", "update"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"pods", "nodes", "configmaps"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"apps"},
 				Resources: []string{"deployments", "replicasets", "daemonsets", "statefulsets"},
-				Verbs:     []string{"get", "patch", "list", "watch", "update"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"batch"},
 				Resources: []string{"jobs", "cronjobs"},
-				Verbs:     []string{"get", "patch", "list", "watch", "update"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 			{
 				APIGroups: []string{"security.kubearmor.com"},
@@ -215,7 +221,7 @@ func GetRelayClusterRole() *rbacv1.ClusterRole {
 			{
 				APIGroups: []string{""},
 				Resources: []string{"pods"},
-				Verbs:     []string{"get", "list"},
+				Verbs:     []string{"list", "watch"},
 			},
 		},
 	}
@@ -258,6 +264,7 @@ func GenerateDaemonSet(env, namespace string) *appsv1.DaemonSet {
 	var terminationGracePeriodSeconds = int64(60)
 	var args = []string{
 		"-gRPC=" + strconv.Itoa(int(port)),
+		"-procfsMount=/host/procfs",
 	}
 
 	var containerVolumeMounts = []corev1.VolumeMount{
@@ -375,7 +382,6 @@ func GenerateDaemonSet(env, namespace string) *appsv1.DaemonSet {
 							Operator: "Exists",
 						},
 					},
-					HostPID:       true,
 					HostNetwork:   true,
 					RestartPolicy: "Always",
 					DNSPolicy:     "ClusterFirstWithHostNet",
@@ -469,32 +475,6 @@ var KubeArmorControllerLabels = map[string]string{
 	"kubearmor-app": "kubearmor-controller",
 }
 
-// GetKubeArmorControllerService Function
-func GetKubeArmorControllerMetricsService(namespace string) *corev1.Service {
-	return &corev1.Service{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Service",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      KubeArmorControllerMetricsServiceName,
-			Labels:    KubeArmorControllerLabels,
-			Namespace: namespace,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: KubeArmorControllerLabels,
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "https",
-					Protocol:   corev1.ProtocolTCP,
-					Port:       int32(8443),
-					TargetPort: intstr.FromString("https"),
-				},
-			},
-		},
-	}
-}
-
 var KubeArmorControllerCertVolumeDefaultMode = int32(420)
 
 var KubeArmorControllerCertVolume = corev1.Volume{
@@ -530,8 +510,7 @@ func GetKubeArmorControllerDeployment(namespace string) *appsv1.Deployment {
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
 						"kubearmor-policy": "audited",
-						"container.apparmor.security.beta.kubernetes.io/manager":         "unconfined",
-						"container.apparmor.security.beta.kubernetes.io/kube-rbac-proxy": "unconfined",
+						"container.apparmor.security.beta.kubernetes.io/manager": "unconfined",
 					},
 					Labels: KubeArmorControllerLabels,
 				},
@@ -542,36 +521,9 @@ func GetKubeArmorControllerDeployment(namespace string) *appsv1.Deployment {
 					},
 					Containers: []corev1.Container{
 						{
-							Name:  "kube-rbac-proxy",
-							Image: "gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0",
-							Args: []string{
-								"--secure-listen-address=0.0.0.0:8443",
-								"--upstream=http://127.0.0.1:8080/",
-								"--logtostderr=true",
-								"--v=10",
-							},
-							Ports: []corev1.ContainerPort{
-								{
-									ContainerPort: 8443,
-									Name:          "https",
-								},
-							},
-							Resources: corev1.ResourceRequirements{
-								Limits: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("100m"),
-									corev1.ResourceMemory: resource.MustParse("40Mi"),
-								},
-								Requests: corev1.ResourceList{
-									corev1.ResourceCPU:    resource.MustParse("100m"),
-									corev1.ResourceMemory: resource.MustParse("20Mi"),
-								},
-							},
-						},
-						{
 							Name:  "manager",
 							Image: "kubearmor/kubearmor-controller:latest",
 							Args: []string{
-								"--metrics-bind-address=127.0.0.1:8080",
 								"--leader-elect",
 								"--health-probe-bind-address=:8081",
 							},
@@ -759,100 +711,6 @@ func GetKubeArmorControllerLeaderElectionRoleBinding(namespace string) *rbacv1.R
 	}
 }
 
-// GetKubeArmorControllerProxyRole Function
-func GetKubeArmorControllerProxyRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ClusterRole",
-			APIVersion: "rbac.authorization.k8s.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: KubeArmorControllerProxyRoleName,
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"authentication.k8s.io"},
-				Resources: []string{"tokenreviews"},
-				Verbs:     []string{"create"},
-			},
-			{
-				APIGroups: []string{"authorization.k8s.io"},
-				Resources: []string{"subjectaccessreviews"},
-				Verbs:     []string{"create"},
-			},
-		},
-	}
-}
-
-// GetKubeArmorControllerProxyRoleBinding Function
-func GetKubeArmorControllerProxyRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ClusterRoleBinding",
-			APIVersion: "rbac.authorization.k8s.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: KubeArmorControllerProxyRoleBindingName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     KubeArmorControllerProxyRoleName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      KubeArmorControllerServiceAccountName,
-				Namespace: namespace,
-			},
-		},
-	}
-}
-
-// GetKubeArmorControllerMetricsReaderRole Function
-func GetKubeArmorControllerMetricsReaderRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ClusterRole",
-			APIVersion: "rbac.authorization.k8s.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: KubeArmorControllerMetricsReaderRoleName,
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				NonResourceURLs: []string{"/metrics"},
-				Verbs:           []string{"get"},
-			},
-		},
-	}
-}
-
-// GetKubeArmorControllerMetricsReaderRoleBinding Function
-func GetKubeArmorControllerMetricsReaderRoleBinding(namespace string) *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "ClusterRoleBinding",
-			APIVersion: "rbac.authorization.k8s.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: KubeArmorControllerMetricsReaderRoleBindingName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     KubeArmorControllerMetricsReaderRoleName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      KubeArmorControllerServiceAccountName,
-				Namespace: namespace,
-			},
-		},
-	}
-}
-
 // GetKubeArmorControllerWebhookService Function
 func GetKubeArmorControllerWebhookService(namespace string) *corev1.Service {
 	return &corev1.Service{
@@ -967,6 +825,9 @@ func GetKubearmorConfigMap(namespace, name string) *corev1.ConfigMap {
 	data[cfg.ConfigDefaultCapabilitiesPosture] = "audit"
 	data[cfg.ConfigDefaultNetworkPosture] = "audit"
 	data[cfg.ConfigDefaultPostureLogs] = "true"
+	data[cfg.ConfigAlertThrottling] = "true"
+	data[cfg.ConfigMaxAlertPerSec] = "10"
+	data[cfg.ConfigThrottleSec] = "30"
 
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{

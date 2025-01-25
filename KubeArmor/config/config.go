@@ -27,6 +27,8 @@ type KubearmorConfig struct {
 	LogPath           string // Log file to use
 	SELinuxProfileDir string // Directory to store SELinux profiles
 	CRISocket         string // Container runtime to use
+	NRISocket         string // NRI socket to use
+	NRIIndex          string // NRI socket to use
 
 	Visibility     string // Container visibility to use
 	HostVisibility string // Host visibility to use
@@ -56,10 +58,12 @@ type KubearmorConfig struct {
 
 	StateAgent bool // enable KubeArmor state agent
 
-	AlertThrottling   bool // Enable/Disable Alert Throttling
-	MaxAlertPerSec    int  // Maximum alerts allowed per second
-	ThrottleSec       int  // Number of seconds for which subsequent alerts will be dropped
-	AnnotateResources bool // enable annotations by kubearmor if kubearmor-controller is not present
+	AlertThrottling   bool  // Enable/Disable Alert Throttling
+	MaxAlertPerSec    int32 // Maximum alerts allowed per second
+	ThrottleSec       int32 // Number of seconds for which subsequent alerts will be dropped
+	AnnotateResources bool  // enable annotations by kubearmor if kubearmor-controller is not present
+
+	ProcFsMount string // path where procfs is hosted
 }
 
 // GlobalCfg Global configuration for Kubearmor
@@ -80,6 +84,8 @@ const (
 	ConfigLogPath                        string = "logPath"
 	ConfigSELinuxProfileDir              string = "seLinuxProfileDir"
 	ConfigCRISocket                      string = "criSocket"
+	ConfigNRISocket                      string = "nriSocket"
+	ConfigNRIIndex                       string = "nriIndex"
 	ConfigVisibility                     string = "visibility"
 	ConfigHostVisibility                 string = "hostVisibility"
 	ConfigKubearmorPolicy                string = "enableKubeArmorPolicy"
@@ -105,6 +111,7 @@ const (
 	ConfigMaxAlertPerSec                 string = "maxAlertPerSec"
 	ConfigThrottleSec                    string = "throttleSec"
 	ConfigAnnotateResources              string = "annotateResources"
+	ConfigProcFsMount                    string = "procfsMount"
 )
 
 func readCmdLineParams() {
@@ -119,6 +126,8 @@ func readCmdLineParams() {
 	logStr := flag.String(ConfigLogPath, "none", "log file path, {path|stdout|none}")
 	seLinuxProfileDirStr := flag.String(ConfigSELinuxProfileDir, "/tmp/kubearmor.selinux", "SELinux profile directory")
 	criSocket := flag.String(ConfigCRISocket, "", "path to CRI socket (format: unix:///path/to/file.sock)")
+	nriSocket := flag.String(ConfigNRISocket, "", "path to NRI socket (format: /path/to/file.sock)")
+	nriIndex := flag.String(ConfigNRIIndex, "99", "NRI plugin index")
 
 	visStr := flag.String(ConfigVisibility, "process,file,network,capabilities", "Container Visibility to use [process,file,network,capabilities,none]")
 	hostVisStr := flag.String(ConfigHostVisibility, "default", "Host Visibility to use [process,file,network,capabilities,none] (default \"none\" for k8s, \"process,file,network,capabilities\" for VM)")
@@ -153,13 +162,15 @@ func readCmdLineParams() {
 
 	stateAgent := flag.Bool(ConfigStateAgent, false, "enabling KubeArmor State Agent client")
 
-	alertThrottling := flag.Bool(ConfigAlertThrottling, false, "enabling Alert Throttling")
+	alertThrottling := flag.Bool(ConfigAlertThrottling, true, "enabling Alert Throttling")
 
 	maxAlertPerSec := flag.Int(ConfigMaxAlertPerSec, 10, "Maximum alerts allowed per second")
 
 	throttleSec := flag.Int(ConfigThrottleSec, 30, "Time period for which subsequent alerts will be dropped (in sec)")
 
 	annotateResources := flag.Bool(ConfigAnnotateResources, false, "for kubearmor deployment without kubearmor-controller")
+
+	procFsMount := flag.String(ConfigProcFsMount, "/proc", "Path to the BPF filesystem to use for storing maps")
 
 	flags := []string{}
 	flag.VisitAll(func(f *flag.Flag) {
@@ -180,6 +191,8 @@ func readCmdLineParams() {
 	viper.SetDefault(ConfigLogPath, *logStr)
 	viper.SetDefault(ConfigSELinuxProfileDir, *seLinuxProfileDirStr)
 	viper.SetDefault(ConfigCRISocket, *criSocket)
+	viper.SetDefault(ConfigNRISocket, *nriSocket)
+	viper.SetDefault(ConfigNRIIndex, *nriIndex)
 
 	viper.SetDefault(ConfigVisibility, *visStr)
 	viper.SetDefault(ConfigHostVisibility, *hostVisStr)
@@ -222,6 +235,8 @@ func readCmdLineParams() {
 	viper.SetDefault(ConfigThrottleSec, *throttleSec)
 
 	viper.SetDefault(ConfigAnnotateResources, *annotateResources)
+
+	viper.SetDefault(ConfigProcFsMount, *procFsMount)
 }
 
 // LoadConfig Load configuration
@@ -238,6 +253,7 @@ func LoadConfig() error {
 	if cfgfile == "" {
 		cfgfile = "kubearmor.yaml"
 	}
+
 	if _, err := os.Stat(cfgfile); err == nil {
 		kg.Printf("setting config from file [%s]", cfgfile)
 		viper.SetConfigFile(cfgfile)
@@ -246,6 +262,8 @@ func LoadConfig() error {
 			return err
 		}
 	}
+
+	kg.Printf("Configuration [%+v]", GlobalCfg)
 
 	GlobalCfg.Cluster = viper.GetString(ConfigCluster)
 	GlobalCfg.Host = viper.GetString(ConfigHost)
@@ -268,8 +286,11 @@ func LoadConfig() error {
 		return fmt.Errorf("CRI socket must start with 'unix://' (%s is invalid)", GlobalCfg.CRISocket)
 	}
 
-	GlobalCfg.Visibility = viper.GetString(ConfigVisibility)
-	GlobalCfg.HostVisibility = viper.GetString(ConfigHostVisibility)
+	GlobalCfg.NRISocket = os.Getenv("NRI_SOCKET")
+	if GlobalCfg.NRISocket == "" {
+		GlobalCfg.NRISocket = viper.GetString(ConfigNRISocket)
+	}
+	GlobalCfg.NRIIndex = viper.GetString(ConfigNRIIndex)
 
 	GlobalCfg.Policy = viper.GetBool(ConfigKubearmorPolicy)
 	GlobalCfg.HostPolicy = viper.GetBool(ConfigKubearmorHostPolicy)
@@ -278,27 +299,9 @@ func LoadConfig() error {
 
 	GlobalCfg.Debug = viper.GetBool(ConfigDebug)
 
-	GlobalCfg.DefaultFilePosture = viper.GetString(ConfigDefaultFilePosture)
-	GlobalCfg.DefaultNetworkPosture = viper.GetString(ConfigDefaultNetworkPosture)
-	GlobalCfg.DefaultCapabilitiesPosture = viper.GetString(ConfigDefaultCapabilitiesPosture)
-
-	GlobalCfg.HostDefaultFilePosture = viper.GetString(ConfigHostDefaultFilePosture)
-	GlobalCfg.HostDefaultNetworkPosture = viper.GetString(ConfigHostDefaultNetworkPosture)
-	GlobalCfg.HostDefaultCapabilitiesPosture = viper.GetString(ConfigHostDefaultCapabilitiesPosture)
-
-	kg.Printf("Configuration [%+v]", GlobalCfg)
-
 	if GlobalCfg.KVMAgent {
 		GlobalCfg.Policy = false
 		GlobalCfg.HostPolicy = true
-	}
-
-	if GlobalCfg.HostVisibility == "default" {
-		if GlobalCfg.KVMAgent || (!GlobalCfg.K8sEnv && GlobalCfg.HostPolicy) {
-			GlobalCfg.HostVisibility = "process,file,network,capabilities"
-		} else { // k8s
-			GlobalCfg.HostVisibility = "none"
-		}
 	}
 
 	GlobalCfg.CoverageTest = viper.GetBool(ConfigCoverageTest)
@@ -309,20 +312,46 @@ func LoadConfig() error {
 
 	GlobalCfg.BPFFsPath = viper.GetString(BPFFsPath)
 
-	GlobalCfg.EnforcerAlerts = viper.GetBool(EnforcerAlerts)
-
-	GlobalCfg.DefaultPostureLogs = viper.GetBool(ConfigDefaultPostureLogs)
-
 	GlobalCfg.InitTimeout = viper.GetString(ConfigInitTimeout)
 
 	GlobalCfg.StateAgent = viper.GetBool(ConfigStateAgent)
 
-	GlobalCfg.AlertThrottling = viper.GetBool(ConfigAlertThrottling)
-	GlobalCfg.MaxAlertPerSec = viper.GetInt(ConfigMaxAlertPerSec)
-	GlobalCfg.ThrottleSec = viper.GetInt(ConfigThrottleSec)
 	GlobalCfg.AnnotateResources = viper.GetBool(ConfigAnnotateResources)
+
+	GlobalCfg.ProcFsMount = viper.GetString(ConfigProcFsMount)
+
+	LoadDynamicConfig()
 
 	kg.Printf("Final Configuration [%+v]", GlobalCfg)
 
 	return nil
+}
+
+// LoadDynamicConfig set dynamic configuration which can be updated at runtime without restarting kubearmor
+func LoadDynamicConfig() {
+	GlobalCfg.DefaultFilePosture = viper.GetString(ConfigDefaultFilePosture)
+	GlobalCfg.DefaultNetworkPosture = viper.GetString(ConfigDefaultNetworkPosture)
+	GlobalCfg.DefaultCapabilitiesPosture = viper.GetString(ConfigDefaultCapabilitiesPosture)
+
+	GlobalCfg.HostDefaultFilePosture = viper.GetString(ConfigHostDefaultFilePosture)
+	GlobalCfg.HostDefaultNetworkPosture = viper.GetString(ConfigHostDefaultNetworkPosture)
+	GlobalCfg.HostDefaultCapabilitiesPosture = viper.GetString(ConfigHostDefaultCapabilitiesPosture)
+
+	GlobalCfg.Visibility = viper.GetString(ConfigVisibility)
+	GlobalCfg.HostVisibility = viper.GetString(ConfigHostVisibility)
+
+	if GlobalCfg.HostVisibility == "default" {
+		if GlobalCfg.KVMAgent || (!GlobalCfg.K8sEnv && GlobalCfg.HostPolicy) {
+			GlobalCfg.HostVisibility = "process,file,network,capabilities"
+		} else { // k8s
+			GlobalCfg.HostVisibility = "none"
+		}
+	}
+
+	GlobalCfg.EnforcerAlerts = viper.GetBool(EnforcerAlerts)
+	GlobalCfg.DefaultPostureLogs = viper.GetBool(ConfigDefaultPostureLogs)
+
+	GlobalCfg.AlertThrottling = viper.GetBool(ConfigAlertThrottling)
+	GlobalCfg.MaxAlertPerSec = int32(viper.GetInt(ConfigMaxAlertPerSec))
+	GlobalCfg.ThrottleSec = int32(viper.GetInt(ConfigThrottleSec))
 }

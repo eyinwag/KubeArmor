@@ -5,6 +5,7 @@ package monitor
 
 import (
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -516,11 +517,39 @@ func (mon *SystemMonitor) UpdateLogs() {
 			case DropAlert: // throttling alert
 				log.Operation = "AlertThreshold"
 				log.Type = "SystemEvent"
-				log.MaxAlertsPerSec = int32(cfg.GlobalCfg.MaxAlertPerSec)
-				log.DroppingAlertsInterval = int32(cfg.GlobalCfg.ThrottleSec)
+				log.MaxAlertsPerSec = cfg.GlobalCfg.MaxAlertPerSec
+				log.DroppingAlertsInterval = cfg.GlobalCfg.ThrottleSec
 
 			default:
 				continue
+			}
+
+			if log.ProcessName == "" {
+				switch log.Operation {
+				case "Process":
+					if log.Resource != "" {
+						if res := strings.Split(log.Resource, " "); len(res) > 0 {
+							log.ProcessName = res[0]
+						}
+					} else {
+						mon.Logger.Debug("Dropping Process Event with empty processName and Resource")
+						continue
+					}
+				case "Network", "File":
+					if log.Source != "" {
+						if src := strings.Split(log.Source, " "); len(src) > 0 {
+							log.ProcessName = src[0]
+						}
+					} else {
+						mon.Logger.Debugf("Dropping %s Event with empty processName and Source", log.Operation)
+						continue
+					}
+				}
+			}
+
+			// fallback logic: in case we get relative path in log.Resource then we join cwd + resource to get pull path
+			if !strings.HasPrefix(strings.Split(log.Resource, " ")[0], "/") && log.Cwd != "/" {
+				log.Resource = filepath.Join(log.Cwd, log.Resource)
 			}
 
 			// get error message

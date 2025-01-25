@@ -8,12 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/client"
 
@@ -144,13 +146,13 @@ func (dh *DockerHandler) GetContainerInfo(containerID string, OwnerInfo map[stri
 
 	pid := strconv.Itoa(inspect.State.Pid)
 
-	if data, err := os.Readlink("/proc/" + pid + "/ns/pid"); err == nil {
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/pid")); err == nil {
 		if _, err := fmt.Sscanf(data, "pid:[%d]\n", &container.PidNS); err != nil {
 			kg.Warnf("Unable to get PidNS (%s, %s, %s)", containerID, pid, err.Error())
 		}
 	}
 
-	if data, err := os.Readlink("/proc/" + pid + "/ns/mnt"); err == nil {
+	if data, err := os.Readlink(filepath.Join(cfg.GlobalCfg.ProcFsMount, pid, "/ns/mnt")); err == nil {
 		if _, err := fmt.Sscanf(data, "mnt:[%d]\n", &container.MntNS); err != nil {
 			kg.Warnf("Unable to get MntNS (%s, %s, %s)", containerID, pid, err.Error())
 		}
@@ -266,7 +268,7 @@ func (dm *KubeArmorDaemon) GetAlreadyDeployedDockerContainers() {
 		}
 	}
 
-	if containerList, err := Docker.DockerClient.ContainerList(context.Background(), types.ContainerListOptions{}); err == nil {
+	if containerList, err := Docker.DockerClient.ContainerList(context.Background(), container.ListOptions{}); err == nil {
 		for _, dcontainer := range containerList {
 			// get container information from docker client
 			container, err := Docker.GetContainerInfo(dcontainer.ID, dm.OwnerInfo)
@@ -430,12 +432,19 @@ func (dm *KubeArmorDaemon) GetAlreadyDeployedDockerContainers() {
 					// update NsMap
 					dm.SystemMonitor.AddContainerIDToNsMap(container.ContainerID, container.NamespaceName, container.PidNS, container.MntNS)
 					dm.RuntimeEnforcer.RegisterContainer(container.ContainerID, container.PidNS, container.MntNS)
+					if dm.Presets != nil {
+						dm.Presets.RegisterContainer(container.ContainerID, container.PidNS, container.MntNS)
+					}
 
 					if len(endPoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
 						dm.Logger.UpdateSecurityPolicies("ADDED", endPoint)
 						if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
 							// enforce security policies
 							dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+						}
+						if dm.Presets != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+							// enforce preset rules
+							dm.Presets.UpdateSecurityPolicies(endPoint)
 						}
 					}
 				}
@@ -615,12 +624,20 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 			// update NsMap
 			dm.SystemMonitor.AddContainerIDToNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			if dm.Presets != nil {
+				dm.Presets.RegisterContainer(containerID, container.PidNS, container.MntNS)
+			}
 
 			if len(endPoint.SecurityPolicies) > 0 { // struct can be empty or no policies registered for the endpoint yet
 				dm.Logger.UpdateSecurityPolicies("ADDED", endPoint)
 				if dm.RuntimeEnforcer != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
 					// enforce security policies
 					dm.RuntimeEnforcer.UpdateSecurityPolicies(endPoint)
+				}
+
+				if dm.Presets != nil && endPoint.PolicyEnabled == tp.KubeArmorPolicyEnabled {
+					// enforce preset rules
+					dm.Presets.UpdateSecurityPolicies(endPoint)
 				}
 			}
 		}
@@ -699,6 +716,9 @@ func (dm *KubeArmorDaemon) UpdateDockerContainer(containerID, action string) {
 			// update NsMap
 			dm.SystemMonitor.DeleteContainerIDFromNsMap(containerID, container.NamespaceName, container.PidNS, container.MntNS)
 			dm.RuntimeEnforcer.UnregisterContainer(containerID)
+			if dm.Presets != nil {
+				dm.Presets.UnregisterContainer(containerID)
+			}
 		}
 
 		dm.Logger.Printf("Detected a container (removed/%.12s)", containerID)

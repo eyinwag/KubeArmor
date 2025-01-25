@@ -25,6 +25,10 @@ char LICENSE[] SEC("license") = "Dual BSD/GPL";
 #define BLOCK_POSTURE 141
 #define CAPABLE_KEY 200
 
+enum {
+  IPPROTO_ICMPV6 = 58
+};
+
 enum file_hook_type { dpath = 0, dfileread, dfilewrite };
 
 enum deny_by_default {
@@ -73,6 +77,40 @@ struct {
   __type(value, bufs_k);
   __uint(max_entries, 3);
 } bufk SEC(".maps");
+
+// ============
+// match prefix
+// ============
+
+static __always_inline int string_prefix_match(const char *name, const char *prefix, size_t prefix_len) {
+    int i = 0;
+    while (i < prefix_len - 1 && name[i] != '\0' && name[i] == prefix[i]) {
+        i++;
+    }
+    return (i == prefix_len - 1) ? 1 : 0;
+}
+
+// ============
+// == preset ==
+// ============
+
+enum preset_action {
+  AUDIT = 1,
+  BLOCK
+};
+
+enum preset_type {
+  FILELESS_EXEC = 1001,
+  ANON_MAP_EXEC
+};
+
+struct preset_map {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __uint(key_size, sizeof(struct outer_key));
+  __uint(value_size, sizeof(u32));
+  __uint(pinning, LIBBPF_PIN_BY_NAME);
+};
 
 typedef struct {
   u64 ts;
@@ -172,8 +210,8 @@ static __always_inline bool prepend_path(struct path *path, bufs_t *string_p) {
     return false;
   }
 
-  struct dentry *dentry = path->dentry;
-  struct vfsmount *vfsmnt = path->mnt;
+  struct dentry *dentry = BPF_CORE_READ(path, dentry);
+  struct vfsmount *vfsmnt = BPF_CORE_READ(path, mnt);
 
   struct mount *mnt = real_mount(vfsmnt);
 
@@ -183,7 +221,7 @@ static __always_inline bool prepend_path(struct path *path, bufs_t *string_p) {
   struct qstr d_name;
 
 #pragma unroll
-  for (int i = 0; i < 30; i++) {
+  for (int i = 0; i < 20; i++) {
     parent = BPF_CORE_READ(dentry, d_parent);
     mnt_root = BPF_CORE_READ(vfsmnt, mnt_root);
 
@@ -272,6 +310,9 @@ static inline void get_outer_key(struct outer_key *pokey,
                                  struct task_struct *t) {
   pokey->pid_ns = get_task_pid_ns_id(t);
   pokey->mnt_ns = get_task_mnt_ns_id(t);
+  // TODO: Use cgroup ns as well for host process identification to support enforcement on deployments using hostpidns
+  // u32 cg_ns = BPF_CORE_READ(t, nsproxy, cgroup_ns, ns).inum;
+  // if (pokey->pid_ns == PROC_PID_INIT_INO && cg_ns == PROC_CGROUP_INIT_INO) {
   if (pokey->pid_ns == PROC_PID_INIT_INO) {
     pokey->pid_ns = 0;
     pokey->mnt_ns = 0;
@@ -288,20 +329,13 @@ static __always_inline u32 init_context(event *event_data) {
   event_data->host_ppid = get_task_ppid(task);
   event_data->host_pid = bpf_get_current_pid_tgid() >> 32;
 
-  u32 pid = get_task_ns_tgid(task);
-  if (event_data->host_pid == pid) { // host
-    event_data->pid_id = 0;
-    event_data->mnt_id = 0;
+  struct outer_key okey;
+  get_outer_key(&okey, task);
+  event_data->pid_id = okey.pid_ns;
+  event_data->mnt_id = okey.mnt_ns;
 
-    event_data->ppid = get_task_ppid(task);
-    event_data->pid = bpf_get_current_pid_tgid() >> 32;
-  } else { // container
-    event_data->pid_id = get_task_pid_ns_id(task);
-    event_data->mnt_id = get_task_mnt_ns_id(task);
-
-    event_data->ppid = get_task_ns_ppid(task);
-    event_data->pid = pid;
-  }
+  event_data->ppid = get_task_ppid(task);
+  event_data->pid =  get_task_ns_tgid(task);
 
   event_data->uid = bpf_get_current_uid_gid();
 
@@ -487,10 +521,15 @@ static inline int match_and_enforce_path_hooks(struct path *f_path, u32 id,
   if (src_offset == NULL)
     fromSourceCheck = false;
 
-  void *ptr = &src_buf->buf[*src_offset];
+  void *src_ptr;
+  if (src_buf->buf[*src_offset]) {
+    src_ptr = &src_buf->buf[*src_offset];
+  }
+  if (src_ptr == NULL)
+    fromSourceCheck = false;
 
   if (fromSourceCheck) {
-    bpf_probe_read_str(store->source, MAX_STRING_SIZE, ptr);
+    bpf_probe_read_str(store->source, MAX_STRING_SIZE, src_ptr);
 
     val = bpf_map_lookup_elem(inner, store);
 

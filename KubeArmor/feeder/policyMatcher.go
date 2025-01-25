@@ -28,25 +28,63 @@ func GetProtocolFromName(proto string) string {
 		return "protocol=UDP,type=SOCK_DGRAM"
 	case "icmp":
 		return "protocol=ICMP,type=SOCK_RAW"
-	case "raw":
-		return "type=SOCK_RAW"
+	case "icmpv6":
+		return "protocol=ICMPv6,type=SOCK_RAW"
+	case "sctp":
+		return "protocol=SCTP,type=SOCK_STREAM|SOCK_SEQPACKET"
 	default:
-		return "unknown"
+		return proto
+	}
+}
+
+func GetProtocolFromType(proto int32) string {
+	switch proto {
+	case 1:
+		return "type=SOCK_STREAM"
+	case 2:
+		return "type=SOCK_DGRAM"
+	case 3:
+		return "type=SOCK_RAW"
+	case 4:
+		return "type=SOCK_RDM"
+	case 5:
+		return "type=SOCK_SEQPACKET"
+	case 6:
+		return "type=SOCK_DCCP"
+	case 10:
+		return "type=SOCK_PACKET"
+	default:
+		return string(proto)
 	}
 }
 
 func fetchProtocol(resource string) string {
-	if strings.Contains(resource, "protocol=TCP") || (strings.Contains(resource, "SOCK_STREAM") && strings.Contains(resource, "protocol=0")) {
+	if strings.Contains(resource, "protocol=TCP") || (strings.Contains(resource, "SOCK_STREAM") && strings.Contains(resource, "protocol=HOPOPT")) {
 		return "tcp"
-	} else if strings.Contains(resource, "protocol=UDP") || (strings.Contains(resource, "SOCK_DGRAM") && strings.Contains(resource, "protocol=0")) {
+	} else if strings.Contains(resource, "protocol=UDP") || (strings.Contains(resource, "SOCK_DGRAM") && strings.Contains(resource, "protocol=HOPOPT")) {
 		return "udp"
 	} else if strings.Contains(resource, "protocol=ICMP") {
 		return "icmp"
 	} else if strings.Contains(resource, "SOCK_RAW") {
 		return "raw"
+	} else if strings.Contains(resource, "protocol=ICMPv6") {
+		return "icmpv6"
+	} else if strings.Contains(resource, "protocol=SCTP") {
+		return "sctp"
+	} else if strings.Contains(resource, "SOCK_STREAM") {
+		return "stream"
+	} else if strings.Contains(resource, "SOCK_DGRAM") {
+		return "dgram"
+	} else if strings.Contains(resource, "SOCK_RDM") {
+		return "rdm"
+	} else if strings.Contains(resource, "SOCK_SEQPACKET") {
+		return "seqpacket"
+	} else if strings.Contains(resource, "SOCK_DCCP") {
+		return "dccp"
+	} else if strings.Contains(resource, "SOCK_PACKET") {
+		return "packet"
 	}
-
-	return "unknown"
+	return resource
 }
 
 func getFileProcessUID(path string) string {
@@ -204,7 +242,7 @@ func (fd *Feeder) newMatchPolicy(policyEnabled int, policyName, src string, mp i
 		match.Message = npt.Message
 
 		match.Operation = "Network"
-		match.Resource = npt.Protocol
+		match.Resource = strings.ToLower(npt.Protocol)
 		match.ResourceType = "Protocol"
 
 		// TODO: Handle cases where AppArmor network enforcement is not present
@@ -266,8 +304,9 @@ func (fd *Feeder) UpdateSecurityPolicies(action string, endPoint tp.EndPoint) {
 	name := endPoint.NamespaceName + "_" + endPoint.EndPointName
 
 	if action == "DELETED" {
-		delete(fd.SecurityPolicies, name)
-		return
+		if _, ok := fd.SecurityPolicies[name]; ok {
+			delete(fd.SecurityPolicies, name)
+		}
 	}
 
 	// ADDED | MODIFIED
@@ -934,9 +973,17 @@ func matchResources(secPolicy tp.MatchPolicy, log tp.Log) bool {
 		if secPolicy.ResourceType == "Path" && secPolicy.Resource == firstLogResource {
 			return true
 		}
+
+		// check if the log's resource directory starts with the policy's resource directory
 		if secPolicy.ResourceType == "Directory" && (strings.HasPrefix(firstLogResourceDir, secPolicy.Resource) &&
+			// for non-recursive rule - check if the directory depth of the log matches the policy resource's depth
 			((!secPolicy.Recursive && firstLogResourceDirCount == strings.Count(secPolicy.Resource, "/")) ||
-				(secPolicy.Recursive && firstLogResourceDirCount >= strings.Count(secPolicy.Resource, "/")))) || (secPolicy.Resource == (log.Resource + "/")) {
+				// for recursive rule - check the log's directory is at the same or deeper level than the policy's resource
+				(secPolicy.Recursive && firstLogResourceDirCount >= strings.Count(secPolicy.Resource, "/")))) ||
+			// exact matching - check if the policy's resource is exactly the logged resource with a trailing slash
+			(secPolicy.Resource == (log.Resource + "/")) ||
+			// match if the policy is recursive and applies to the root directory
+			(secPolicy.Resource == "/" && secPolicy.Recursive) {
 			return true
 		}
 	}
@@ -1054,6 +1101,11 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 					continue
 				}
 
+				// when one of the below rule is already matched for the log event, we will skip for further matches
+				if skip {
+					break // break, so that once source is matched for a log it doesn't look for other cases
+				}
+
 				// match sources
 				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (secPolicy.Source == log.ParentProcessName || secPolicy.Source == log.ProcessName)) {
 					matchedRegex := false
@@ -1159,6 +1211,7 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 							log.Enforcer = "eBPF Monitor"
 							log.Action = secPolicy.Action
 
+							skip = true
 							continue
 						}
 
@@ -1190,6 +1243,7 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 
 							log.Action = secPolicy.Action
 
+							skip = true
 							continue
 						}
 
@@ -1283,11 +1337,11 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 					break // break, so that once source is matched for a log it doesn't look for other cases
 				}
 				// match sources
-				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (secPolicy.Source == log.ParentProcessName || secPolicy.Source == log.ProcessName)) {
+				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (strings.HasPrefix(log.Source, secPolicy.Source+" ") || secPolicy.Source == log.ProcessName)) {
 					matchedFlags := false
 
 					protocol := fetchProtocol(log.Resource)
-					if protocol == secPolicy.Resource {
+					if protocol == secPolicy.Resource || secPolicy.Resource == "all" {
 						matchedFlags = true
 					}
 
@@ -1465,7 +1519,7 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 					continue
 				}
 				// match sources
-				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (secPolicy.Source == log.ParentProcessName || secPolicy.Source == log.ProcessName)) {
+				if (!secPolicy.IsFromSource) || (secPolicy.IsFromSource && (strings.HasPrefix(log.Source, secPolicy.Source+" ") || secPolicy.Source == log.ProcessName)) {
 					skip := false
 
 					for _, matchCapability := range strings.Split(secPolicy.Resource, ",") {
@@ -1725,39 +1779,25 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 				return tp.Log{}
 			}
 
-			// check for throttling for "Audit" alerts
-			if cfg.GlobalCfg.AlertThrottling && strings.Contains(log.Action, "Audit") {
-				nsKey := fd.ContainerNsKey[log.ContainerID]
-				alert, throttle := fd.ShouldDropAlertsPerContainer(nsKey.PidNs, nsKey.MntNs)
-				if alert && throttle {
-					return tp.Log{}
-				} else if alert && !throttle {
-					log.Operation = "AlertThreshold"
-					log.Type = "SystemEvent"
-					log.MaxAlertsPerSec = int32(cfg.GlobalCfg.MaxAlertPerSec)
-					log.DroppingAlertsInterval = int32(cfg.GlobalCfg.ThrottleSec)
-				}
-			}
-
 			return log
 		}
 	} else { // host
 		if log.Type == "" {
 			// host log
 			if log.Operation == "Process" {
-				if setLogFields(&log, existFileAllowPolicy, "allow", fd.Node.ProcessVisibilityEnabled, false) {
+				if setLogFields(&log, existFileAllowPolicy, cfg.GlobalCfg.DefaultFilePosture, fd.Node.ProcessVisibilityEnabled, false) {
 					return log
 				}
 			} else if log.Operation == "File" {
-				if setLogFields(&log, existFileAllowPolicy, "allow", fd.Node.FileVisibilityEnabled, false) {
+				if setLogFields(&log, existFileAllowPolicy, cfg.GlobalCfg.DefaultFilePosture, fd.Node.FileVisibilityEnabled, false) {
 					return log
 				}
 			} else if log.Operation == "Network" {
-				if setLogFields(&log, existNetworkAllowPolicy, "allow", fd.Node.NetworkVisibilityEnabled, false) {
+				if setLogFields(&log, existNetworkAllowPolicy, cfg.GlobalCfg.DefaultNetworkPosture, fd.Node.NetworkVisibilityEnabled, false) {
 					return log
 				}
 			} else if log.Operation == "Capabilities" {
-				if setLogFields(&log, existCapabilitiesAllowPolicy, "allow", fd.Node.CapabilitiesVisibilityEnabled, false) {
+				if setLogFields(&log, existCapabilitiesAllowPolicy, cfg.GlobalCfg.DefaultCapabilitiesPosture, fd.Node.CapabilitiesVisibilityEnabled, false) {
 					return log
 				}
 			}
@@ -1766,20 +1806,6 @@ func (fd *Feeder) UpdateMatchedPolicy(log tp.Log) tp.Log {
 
 			if log.Action == "Allow" && log.Result == "Passed" {
 				return tp.Log{}
-			}
-
-			// check for throttling for "Audit" alerts
-			if cfg.GlobalCfg.AlertThrottling && strings.Contains(log.Action, "Audit") {
-				nsKey := fd.ContainerNsKey[log.ContainerID]
-				alert, throttle := fd.ShouldDropAlertsPerContainer(nsKey.PidNs, nsKey.MntNs)
-				if alert && throttle {
-					return tp.Log{}
-				} else if alert && !throttle {
-					log.Operation = "AlertThreshold"
-					log.Type = "SystemEvent"
-					log.MaxAlertsPerSec = int32(cfg.GlobalCfg.MaxAlertPerSec)
-					log.DroppingAlertsInterval = int32(cfg.GlobalCfg.ThrottleSec)
-				}
 			}
 
 			return log

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	deployments "github.com/kubearmor/KubeArmor/deployments/get"
+	securityv1 "github.com/kubearmor/KubeArmor/pkg/KubeArmorController/api/security.kubearmor.com/v1"
 	opv1 "github.com/kubearmor/KubeArmor/pkg/KubeArmorOperator/api/operator.kubearmor.com/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -85,6 +86,8 @@ var (
 	ConfigMaxAlertPerSec             string = "maxAlertPerSec"
 	ConfigThrottleSec                string = "throttleSec"
 
+	GlobalImagePullSecrets []corev1.LocalObjectReference = []corev1.LocalObjectReference{}
+	GlobalTolerations      []corev1.Toleration           = []corev1.Toleration{}
 	//KubearmorRelayEnvVariables
 
 	EnableStdOutAlerts string = "enableStdOutAlerts"
@@ -92,23 +95,45 @@ var (
 	EnableStdOutMsgs   string = "enableStdOutMsgs"
 
 	// Images
-	KubeArmorName                      string = "kubearmor"
-	KubeArmorImage                     string = "kubearmor/kubearmor:stable"
-	KubeArmorImagePullPolicy           string = "Always"
-	KubeArmorInitName                  string = "kubearmor-init"
-	KubeArmorInitImage                 string = "kubearmor/kubearmor-init:stable"
-	KubeArmorInitImagePullPolicy       string = "Always"
-	KubeArmorRelayName                 string = "kubearmor-relay"
-	KubeArmorRelayImage                string = "kubearmor/kubearmor-relay-server:latest"
-	KubeArmorRelayImagePullPolicy      string = "Always"
-	KubeArmorControllerName            string = "kubearmor-controller"
-	KubeArmorControllerImage           string = "kubearmor/kubearmor-controller:latest"
-	KubeArmorControllerImagePullPolicy string = "Always"
-	KubeRbacProxyName                  string = "kube-rbac-proxy"
-	KubeRbacProxyImage                 string = "gcr.io/kubebuilder/kube-rbac-proxy:v0.15.0"
-	KubeRbacProxyImagePullPolicy       string = "Always"
-	SeccompProfile                            = "kubearmor-seccomp.json"
-	SeccompInitProfile                        = "kubearmor-init-seccomp.json"
+	KubeArmorName string   = "kubearmor"
+	KubeArmorArgs []string = []string{
+		"-gRPC=32767",
+		"-procfsMount=/host/procfs",
+		"-tlsEnabled=false",
+	}
+	KubeArmorImage            string                        = "kubearmor/kubearmor:stable"
+	KubeArmorImagePullPolicy  string                        = "Always"
+	KubeArmorImagePullSecrets []corev1.LocalObjectReference = []corev1.LocalObjectReference{}
+	KubeArmorTolerations      []corev1.Toleration           = []corev1.Toleration{}
+
+	KubeArmorInitName             string                        = "kubearmor-init"
+	KubeArmorInitArgs             []string                      = []string{}
+	KubeArmorInitImage            string                        = "kubearmor/kubearmor-init:stable"
+	KubeArmorInitImagePullPolicy  string                        = "Always"
+	KubeArmorInitImagePullSecrets []corev1.LocalObjectReference = []corev1.LocalObjectReference{}
+	KubeArmorInitTolerations      []corev1.Toleration           = []corev1.Toleration{}
+
+	KubeArmorRelayName string   = "kubearmor-relay"
+	KubeArmorRelayArgs []string = []string{
+		"-tlsEnabled=false",
+	}
+	KubeArmorRelayImage            string                        = "kubearmor/kubearmor-relay-server:latest"
+	KubeArmorRelayImagePullPolicy  string                        = "Always"
+	KubeArmorRelayImagePullSecrets []corev1.LocalObjectReference = []corev1.LocalObjectReference{}
+	KubeArmorRelayTolerations      []corev1.Toleration           = []corev1.Toleration{}
+
+	KubeArmorControllerName string   = "kubearmor-controller"
+	KubeArmorControllerArgs []string = []string{
+		"--leader-elect",
+		"--health-probe-bind-address=:8081",
+	}
+	KubeArmorControllerImage            string                        = "kubearmor/kubearmor-controller:latest"
+	KubeArmorControllerImagePullPolicy  string                        = "Always"
+	KubeArmorControllerImagePullSecrets []corev1.LocalObjectReference = []corev1.LocalObjectReference{}
+	KubeArmorControllerTolerations      []corev1.Toleration           = []corev1.Toleration{}
+
+	SeccompProfile     = "kubearmor-seccomp.json"
+	SeccompInitProfile = "kubearmor-init-seccomp.json"
 
 	// tls
 	EnableTls                      bool     = false
@@ -119,7 +144,45 @@ var (
 	KubeArmorRelayServerSecretName string   = "kubearmor-relay-server-certs"
 	DefaultTlsCertPath             string   = "/var/lib/kubearmor/tls"
 	DefaultMode                    int32    = 420 // deciaml representation of octal value 644
+
+	// throttling
+	AlertThrottling       bool   = true
+	DefaultMaxAlertPerSec string = "10"
+	DefaultThrottleSec    string = "30"
+
+	// recommend policies
+	RecommendedPolicies opv1.RecommendedPolicies = opv1.RecommendedPolicies{
+		MatchExpressions: []securityv1.MatchExpressionsType{
+			{
+				Key:      "namespace",
+				Operator: "NotIn",
+				Values: []string{
+					"kube-system",
+					"kubearmor",
+				},
+			},
+		},
+	}
+
+	Adapter opv1.Adapters = opv1.Adapters{
+		ElasticSearch: opv1.ElasticSearchAdapter{
+			Enabled:         false,
+			Url:             "",
+			AlertsIndexName: "kubearmor-alerts",
+			Auth: opv1.ElasticSearchAuth{
+				SecretName:       "elastic-secret",
+				UserNameKey:      "username",
+				PasswordKey:      "password",
+				AllowTlsInsecure: false,
+				CAcertSecretName: "",
+				CaCertKey:        "ca.crt",
+			},
+		},
+	}
+
+	ElasticSearchAdapterCaCertPath = "/cert"
 )
+var Pointer2True bool = true
 
 var ConfigMapData = map[string]string{
 	ConfigGRPC:                       "32767",
@@ -129,7 +192,7 @@ var ConfigMapData = map[string]string{
 	ConfigDefaultNetworkPosture:      "audit",
 	ConfigVisibility:                 "process,network,capabilities",
 	ConfigDefaultPostureLogs:         "true",
-	ConfigAlertThrottling:            "false",
+	ConfigAlertThrottling:            "true",
 	ConfigMaxAlertPerSec:             "10",
 	ConfigThrottleSec:                "30",
 }
@@ -150,6 +213,8 @@ var ContainerRuntimeSocketMap = map[string][]string{
 		"/run/docker.sock",
 	},
 	"containerd": {
+		"/run/nri/nri.sock",
+		"/var/run/nri/nri.sock",
 		"/var/snap/microk8s/common/run/containerd.sock",
 		"/run/k0s/containerd.sock",
 		"/run/k3s/containerd/containerd.sock",
@@ -160,6 +225,10 @@ var ContainerRuntimeSocketMap = map[string][]string{
 	"cri-o": {
 		"/var/run/crio/crio.sock",
 		"/run/crio/crio.sock",
+	},
+	"nri": {
+		"/var/run/nri/nri.sock",
+		"/run/nri/nri.sock",
 	},
 }
 
@@ -195,6 +264,7 @@ var RuntimeSocketLocation = map[string]string{
 	"docker":     "/var/run/docker.sock",
 	"containerd": "/var/run/containerd/containerd.sock",
 	"cri-o":      "/var/run/crio/crio.sock",
+	"nri":        "/var/run/nri/nri.sock",
 }
 
 func ShortSHA(s string) string {
@@ -232,12 +302,26 @@ var CommonVolumes = []corev1.Volume{
 			},
 		},
 	},
+	{
+		Name: "proc-fs-mount",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{
+				Path: "/proc",
+				Type: &HostPathDirectory,
+			},
+		},
+	},
 }
 
 var CommonVolumesMount = []corev1.VolumeMount{
 	{
 		Name:      "sys-kernel-debug-path",
 		MountPath: "/sys/kernel/debug",
+	},
+	{
+		Name:      "proc-fs-mount",
+		MountPath: "/host/procfs",
+		ReadOnly:  true,
 	},
 }
 
@@ -431,11 +515,6 @@ func GetApplicationImage(app string) string {
 			return image
 		}
 		return KubeArmorControllerImage
-	case KubeRbacProxyName:
-		if image := os.Getenv("RELATED_IMAGE_KUBE_RBAC_PROXY"); image != "" {
-			return image
-		}
-		return KubeRbacProxyImage
 	case SnitchName:
 		if image := os.Getenv("RELATED_IMAGE_KUBEARMOR_SNITCH"); image != "" {
 			return image
@@ -512,4 +591,15 @@ func AddOrRemoveVolume(src *[]corev1.Volume, dest *[]corev1.Volume, action strin
 	if action == AddAction {
 		*dest = append(*dest, *src...)
 	}
+}
+
+func ParseArgument(arg string) (key string, value string, found bool) {
+	arg = strings.TrimLeft(arg, "-")
+
+	parts := strings.SplitN(arg, "=", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+
+	return parts[0], parts[1], true
 }

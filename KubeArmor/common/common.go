@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	kc "github.com/kubearmor/KubeArmor/KubeArmor/config"
@@ -291,7 +292,11 @@ func GetCommandOutputWithoutErr(cmd string, args []string) string {
 		return ""
 	}
 
+	var wg sync.WaitGroup
+	wg.Add(1)
+
 	go func() {
+		defer wg.Done()
 		defer func() {
 			if err = stdin.Close(); err != nil {
 				kg.Warnf("Error closing stdin %s\n", err)
@@ -299,6 +304,9 @@ func GetCommandOutputWithoutErr(cmd string, args []string) string {
 		}()
 		_, _ = io.WriteString(stdin, "values written to stdin are passed to cmd's standard input")
 	}()
+
+	// Wait for the stdin writing to complete
+	wg.Wait()
 
 	out, err := res.CombinedOutput()
 	if err != nil {
@@ -432,6 +440,24 @@ var ContainerRuntimeSocketMap = map[string][]string{
 		"/var/run/crio/crio.sock",
 		"/run/crio/crio.sock",
 	},
+}
+
+// NRISocketMap Structure
+var NRISocketMap = map[string][]string{
+	"nri": {
+		"/var/run/nri/nri.sock",
+		"/run/nri/nri.sock",
+	},
+}
+
+// GetNRISocket Function
+func GetNRISocket(ContainerRuntime string) string {
+	for _, candidate := range NRISocketMap["nri"] {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return ""
 }
 
 // GetCRISocket Function
